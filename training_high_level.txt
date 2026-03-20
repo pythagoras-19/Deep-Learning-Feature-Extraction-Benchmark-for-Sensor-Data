@@ -21,3 +21,20 @@ Preprocess steps: read csv, clean data, encode labels, normalize features, split
 
 Define loss function: Quantify how WRONG the model is.... use nn.CrossEntropyLoss()
 
+Define optimizer: Adam
+
+logits: raw unnormalized outputs of a model before probabilities. They are just numbers the model produces -- not probabilities yet.
+    a. can be negative
+    b. dont sum to 1
+    c. they are not bounded between 0 and 1
+
+gradients: how the model learns
+    a. slope
+    b. "if i change this parameter slightly, how does the loss change?"
+
+Loss: what the model is trying to minimize
+    a. "How bad was that prediction?"
+    b. NN output NUMBERS, but learning requires a scalar OBJECTIVE that can be optimized
+    c. without Loss, you cannot compute gradients, and you cannot improve the model
+
+
