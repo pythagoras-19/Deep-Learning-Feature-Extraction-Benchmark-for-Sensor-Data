@@ -1,0 +1,23 @@
+To train data do these steps:
+
+1. Load data & clean data
+2. Initialize the model
+3. Define the loss function
+4. Define optimizer
+5. Repeat (epochs)
+    a. Forward pass (predict)
+    b. Compute loss
+    c. Backward pass (gradients)
+    d. Update weights
+6. Evaluate model
+
+
+
+------------------------------
+
+
+Preprocess steps: read csv, clean data, encode labels, normalize features, split into train/test, wrap in DataLoader
+
+
+Define loss function: Quantify how WRONG the model is.... use nn.CrossEntropyLoss()
+
