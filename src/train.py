@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import random
+import re
 import sys
+import unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -18,7 +20,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from torch import nn
 from torch.optim import Adam
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 try:
     from models.cnn_model import TrafficCNN
@@ -128,6 +130,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path to export final test predictions as CSV.",
     )
+    parser.add_argument(
+        "--use-class-weights",
+        action="store_true",
+        help="Use class weights computed from the training split in CrossEntropyLoss.",
+    )
+    parser.add_argument(
+        "--use-weighted-sampler",
+        action="store_true",
+        help="Use WeightedRandomSampler for the training DataLoader.",
+    )
 
     args = parser.parse_args()
 
@@ -154,6 +166,32 @@ def set_seed(seed: int) -> None:
     if torch.backends.cudnn.is_available():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+
+def normalize_label_name(label: str) -> str:
+    label = unicodedata.normalize("NFKC", label).strip()
+
+    exact_replacements = {
+        "Web Attack Brute Force": "Web Attack - Brute Force",
+        "Web Attack Sql Injection": "Web Attack - Sql Injection",
+        "Web Attack XSS": "Web Attack - XSS",
+        "Web Attack ï Brute Force": "Web Attack - Brute Force",
+        "Web Attack ï Sql Injection": "Web Attack - Sql Injection",
+        "Web Attack ï XSS": "Web Attack - XSS",
+        "Web Attack � Brute Force": "Web Attack - Brute Force",
+        "Web Attack � Sql Injection": "Web Attack - Sql Injection",
+        "Web Attack � XSS": "Web Attack - XSS",
+    }
+    if label in exact_replacements:
+        return exact_replacements[label]
+
+    for bad_char in ("\ufffd", "�", "\u2013", "\u2014", "\x96"):
+        label = label.replace(bad_char, "-")
+
+    label = re.sub(r"Web Attack\s*-\s*", "Web Attack - ", label)
+    label = re.sub(r"\s*-\s*", " - ", label)
+    label = re.sub(r"\s+", " ", label).strip()
+    return label
 
 
 def resolve_label_column(columns: pd.Index, expected_label: str) -> str:
@@ -213,7 +251,7 @@ def clean_dataframe(
     dataframe.columns = dataframe.columns.str.strip()
     dataframe = dataframe.replace([np.inf, -np.inf], np.nan)
 
-    labels = dataframe[label_column].astype(str).str.strip()
+    labels = dataframe[label_column].astype(str).str.strip().map(normalize_label_name)
     labels = labels.replace({"": np.nan, "nan": np.nan, "None": np.nan})
 
     feature_frame = dataframe.drop(columns=[label_column, *metadata_columns], errors="ignore")
@@ -285,7 +323,7 @@ def prepare_dataset(raw_dataframes: list[pd.DataFrame], label_column: str) -> pd
 
 def get_stratify_labels(labels: pd.Series) -> pd.Series | None:
     class_counts = labels.value_counts()
-    if class_counts.nunique() == 0:
+    if class_counts.empty:
         return None
     if len(class_counts) < 2:
         return None
@@ -427,6 +465,22 @@ def print_class_counts(split_name: str, labels: pd.Series) -> None:
         print(f"  {class_name}: {int(count)}")
 
 
+def compute_class_weights(y_train: np.ndarray, num_classes: int) -> torch.Tensor:
+    class_counts = np.bincount(y_train, minlength=num_classes)
+    weights = np.zeros(num_classes, dtype=np.float32)
+
+    nonzero_mask = class_counts > 0
+    weights[nonzero_mask] = len(y_train) / (num_classes * class_counts[nonzero_mask])
+
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def print_class_weights(label_encoder: LabelEncoder, class_weights: torch.Tensor) -> None:
+    print("Training class weights:")
+    for class_name, weight in zip(label_encoder.classes_, class_weights.tolist()):
+        print(f"  {class_name}: {weight:.4f}")
+
+
 def build_dataloaders(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -435,7 +489,8 @@ def build_dataloaders(
     batch_size: int,
     num_workers: int,
     random_state: int,
-) -> tuple[dict[str, DataLoader], LabelEncoder]:
+    use_weighted_sampler: bool,
+) -> tuple[dict[str, DataLoader], LabelEncoder, torch.Tensor]:
     feature_columns = [
         column for column in train_df.columns
         if column not in {label_column, SOURCE_COLUMN}
@@ -460,6 +515,8 @@ def build_dataloaders(
     x_val = scaler.transform(x_val)
     x_test = scaler.transform(x_test)
 
+    class_weights = compute_class_weights(y_train, len(label_encoder.classes_))
+
     train_dataset = TensorDataset(
         torch.tensor(x_train, dtype=torch.float32),
         torch.tensor(y_train, dtype=torch.long),
@@ -476,15 +533,28 @@ def build_dataloaders(
     pin_memory = torch.cuda.is_available()
     generator = torch.Generator().manual_seed(random_state)
 
+    train_loader_kwargs: dict[str, object] = {
+        "dataset": train_dataset,
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+
+    if use_weighted_sampler:
+        sample_weights = class_weights.numpy()[y_train]
+        sampler = WeightedRandomSampler(
+            weights=torch.tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        train_loader_kwargs["sampler"] = sampler
+        train_loader_kwargs["shuffle"] = False
+    else:
+        train_loader_kwargs["shuffle"] = True
+        train_loader_kwargs["generator"] = generator
+
     dataloaders = {
-        "train": DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            generator=generator,
-        ),
+        "train": DataLoader(**train_loader_kwargs),
         "val": DataLoader(
             val_dataset,
             batch_size=batch_size,
@@ -501,7 +571,7 @@ def build_dataloaders(
         ),
     }
 
-    return dataloaders, label_encoder
+    return dataloaders, label_encoder, class_weights
 
 
 def train_one_epoch(
@@ -564,20 +634,28 @@ def evaluate(
     y_true = np.concatenate(all_targets)
     y_pred = np.concatenate(all_predictions)
 
-    accuracy = accuracy_score(y_true, y_pred)
-    precision, recall, f1_score, _ = precision_recall_fscore_support(
+    weighted_precision, weighted_recall, weighted_f1, _ = precision_recall_fscore_support(
         y_true,
         y_pred,
         average="weighted",
         zero_division=0,
     )
+    macro_precision, macro_recall, macro_f1, _ = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        average="macro",
+        zero_division=0,
+    )
 
     metrics: dict[str, object] = {
         "loss": running_loss / max(total_examples, 1),
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1_score,
+        "accuracy": accuracy_score(y_true, y_pred),
+        "weighted_precision": weighted_precision,
+        "weighted_recall": weighted_recall,
+        "weighted_f1": weighted_f1,
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f1": macro_f1,
     }
 
     if return_predictions:
@@ -623,9 +701,12 @@ def final_test_report(
 
     print("\nFinal test metrics:")
     print(f"  Accuracy: {metrics['accuracy']:.4f}")
-    print(f"  Weighted Precision: {metrics['precision']:.4f}")
-    print(f"  Weighted Recall: {metrics['recall']:.4f}")
-    print(f"  Weighted F1: {metrics['f1']:.4f}")
+    print(f"  Weighted Precision: {metrics['weighted_precision']:.4f}")
+    print(f"  Weighted Recall: {metrics['weighted_recall']:.4f}")
+    print(f"  Weighted F1: {metrics['weighted_f1']:.4f}")
+    print(f"  Macro Precision: {metrics['macro_precision']:.4f}")
+    print(f"  Macro Recall: {metrics['macro_recall']:.4f}")
+    print(f"  Macro F1: {metrics['macro_f1']:.4f}")
 
     print("\nPer-class metrics:")
     for index, class_name in enumerate(class_names):
@@ -684,7 +765,7 @@ def main() -> int:
             test_size=args.test_size,
             random_state=args.random_state,
         )
-        dataloaders, label_encoder = build_dataloaders(
+        dataloaders, label_encoder, class_weights = build_dataloaders(
             train_df=train_df,
             val_df=val_df,
             test_df=test_df,
@@ -692,6 +773,7 @@ def main() -> int:
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             random_state=args.random_state,
+            use_weighted_sampler=args.use_weighted_sampler,
         )
     except Exception as exc:
         print(f"Failed to prepare dataset: {exc}", file=sys.stderr)
@@ -699,7 +781,9 @@ def main() -> int:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TrafficCNN(num_classes=len(label_encoder.classes_)).to(device)
-    loss_fn = nn.CrossEntropyLoss()
+
+    loss_weights = class_weights.to(device) if args.use_class_weights else None
+    loss_fn = nn.CrossEntropyLoss(weight=loss_weights)
     optimizer = Adam(model.parameters(), lr=args.learning_rate)
 
     args.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -709,11 +793,14 @@ def main() -> int:
     print(f"Using {dataset.drop(columns=[args.label_column, SOURCE_COLUMN]).shape[1]} numeric feature(s)")
     print(f"Classes: {list(label_encoder.classes_)}")
     print(f"Training on device: {device}")
+    print(f"Use class weights: {args.use_class_weights}")
+    print(f"Use weighted sampler: {args.use_weighted_sampler}")
 
     print_class_counts("Full dataset", dataset[args.label_column])
     print_class_counts("Train split", train_df[args.label_column])
     print_class_counts("Validation split", val_df[args.label_column])
     print_class_counts("Test split", test_df[args.label_column])
+    print_class_weights(label_encoder, class_weights)
 
     if args.split_mode == "file":
         print("\nFile assignments:")
@@ -744,12 +831,16 @@ def main() -> int:
             f"- train_loss: {train_loss:.4f} "
             f"- val_loss: {val_metrics['loss']:.4f} "
             f"- val_acc: {val_metrics['accuracy']:.4f} "
-            f"- val_precision: {val_metrics['precision']:.4f} "
-            f"- val_recall: {val_metrics['recall']:.4f} "
-            f"- val_f1: {val_metrics['f1']:.4f}"
+            f"- val_weighted_precision: {val_metrics['weighted_precision']:.4f} "
+            f"- val_weighted_recall: {val_metrics['weighted_recall']:.4f} "
+            f"- val_weighted_f1: {val_metrics['weighted_f1']:.4f} "
+            f"- val_macro_precision: {val_metrics['macro_precision']:.4f} "
+            f"- val_macro_recall: {val_metrics['macro_recall']:.4f} "
+            f"- val_macro_f1: {val_metrics['macro_f1']:.4f}"
         )
 
-        score = float(val_metrics[args.selection_metric])
+        score_key = "weighted_f1" if args.selection_metric == "f1" else "accuracy"
+        score = float(val_metrics[score_key])
         if score > best_score:
             best_score = score
             patience_counter = 0
